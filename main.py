@@ -476,37 +476,31 @@ def get_subject_report(subject_id: int):
     connection = get_db_connection()
     try:
         with connection.cursor() as cursor:
-            # 1. ดึงข้อมูลรายวิชา
-            cursor.execute("SELECT * FROM subjects WHERE id = %s", (subject_id,))
-            subject = cursor.fetchone()
-            if not subject:
-                raise HTTPException(status_code=404, detail="ไม่พบรายวิชา")
-
-            # 2. ดึงสถิติจริงจาก attendance_logs (นับรวมทุกรอบที่บันทึก)
-            sql_students = """
+            cursor.execute("""
                 SELECT 
-                    u.id, 
-                    u.student_id, 
-                    u.full_name, 
+                    u.id as user_id,
+                    u.student_id,
+                    u.full_name,
                     u.faculty,
-                    (SELECT COUNT(*) FROM attendance_logs a WHERE a.subject_id = %s AND a.student_id = u.id AND a.status = 'present') as present_count,
-                    (SELECT COUNT(*) FROM attendance_logs a WHERE a.subject_id = %s AND a.student_id = u.id AND a.status = 'late') as late_count,
-                    (SELECT COUNT(*) FROM attendance_logs a WHERE a.subject_id = %s AND a.student_id = u.id AND a.status = 'absent') as absent_count
+                    COUNT(CASE WHEN al.status = 'present' THEN 1 END) as present_count,
+                    COUNT(CASE WHEN al.status = 'late' THEN 1 END) as late_count,
+                    COUNT(CASE WHEN al.status = 'absent' THEN 1 END) as absent_count,
+                    COUNT(CASE WHEN al.status = 'leave' THEN 1 END) as leave_count,
+                    GROUP_CONCAT(
+                        CASE WHEN al.status = 'leave' AND al.note IS NOT NULL AND al.note != '' 
+                        THEN CONCAT(DATE_FORMAT(al.session_date, '%%d/%%m/%%Y'), ': ', al.note) 
+                        END SEPARATOR ' | '
+                    ) as leave_notes
                 FROM subject_students ss
                 JOIN users u ON ss.student_id = u.id
+                LEFT JOIN attendance_logs al ON al.student_id = u.id AND al.subject_id = ss.subject_id
                 WHERE ss.subject_id = %s
+                GROUP BY u.id, u.student_id, u.full_name, u.faculty
                 ORDER BY u.student_id ASC
-            """
-            cursor.execute(sql_students, (subject_id, subject_id, subject_id, subject_id))
-            students_report = cursor.fetchall()
-
-            return {
-                "status": "success",
-                "subject": subject,
-                "students_report": students_report
-            }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            """, (subject_id,))
+            
+            report = cursor.fetchall()
+            return {"status": "success", "students_report": report}
     finally:
         connection.close()
 
@@ -517,15 +511,18 @@ def get_student_subject_history(student_id: int, subject_id: int):
     connection = get_db_connection()
     try:
         with connection.cursor() as cursor:
-            sql = """
-                SELECT session_date, 
-                       TIME_FORMAT(check_in_time, '%%H:%%i:%%s') AS check_in_time, 
-                       status
-                FROM attendance_logs
-                WHERE student_id = %s AND subject_id = %s
-                ORDER BY session_date DESC, check_in_time DESC
-            """
-            cursor.execute(sql, (student_id, subject_id))
+            cursor.execute("""
+                SELECT 
+                    al.id,
+                    al.session_date,
+                    al.check_in_time,
+                    al.status,
+                    al.note
+                FROM attendance_logs al
+                WHERE al.student_id = %s AND al.subject_id = %s
+                ORDER BY al.session_date DESC, al.check_in_time DESC
+            """, (student_id, subject_id))
+            
             history = cursor.fetchall()
             return {"status": "success", "history": history}
     finally:
@@ -540,31 +537,36 @@ def get_student_dashboard(student_id: int):
             cursor.execute("SELECT * FROM users WHERE id = %s", (student_id,))
             student = cursor.fetchone()
 
-            # 2. ดึงรายวิชาทั้งหมดที่นักศึกษาคนนี้ลงทะเบียน (ต้องไม่มี LIMIT ปิดท้าย)
+            # 2. ดึงรายวิชาทั้งหมดที่นักศึกษาคนนี้ลงทะเบียน (เพิ่มการนับสถานะ 'leave')
             sql_courses = """
                 SELECT s.id, s.code, s.name, s.schedule, s.room,
                        (SELECT COUNT(*) FROM attendance_logs a WHERE a.subject_id = s.id AND a.student_id = %s AND a.status = 'present') as present_cnt,
                        (SELECT COUNT(*) FROM attendance_logs a WHERE a.subject_id = s.id AND a.student_id = %s AND a.status = 'late') as late_cnt,
-                       (SELECT COUNT(*) FROM attendance_logs a WHERE a.subject_id = s.id AND a.student_id = %s AND a.status = 'absent') as absent_cnt
+                       (SELECT COUNT(*) FROM attendance_logs a WHERE a.subject_id = s.id AND a.student_id = %s AND a.status = 'absent') as absent_cnt,
+                       (SELECT COUNT(*) FROM attendance_logs a WHERE a.subject_id = s.id AND a.student_id = %s AND a.status = 'leave') as leave_cnt
                 FROM subjects s
                 JOIN subject_students ss ON s.id = ss.subject_id
                 WHERE ss.student_id = %s
             """
-            cursor.execute(sql_courses, (student_id, student_id, student_id, student_id))
+            cursor.execute(sql_courses, (student_id, student_id, student_id, student_id, student_id))
             raw_courses = cursor.fetchall()
 
             courses = []
             total_present = 0
             total_late = 0
             total_absent = 0
+            total_leave = 0  # 📌 เพิ่มตัวแปรเก็บยอดรวมการลา
 
             for c in raw_courses:
                 p = c['present_cnt'] or 0
                 l = c['late_cnt'] or 0
                 a = c['absent_cnt'] or 0
-                total_classes_for_course = p + l + a
+                le = c['leave_cnt'] or 0  # 📌 ดึงค่าการลาของรายวิชานี้
+                
+                total_classes_for_course = p + l + a + le
                 
                 if total_classes_for_course > 0:
+                    # คำนวณอัตราการเข้าเรียน (นับรวมมาและสาย)
                     rate = int(((p + l) / total_classes_for_course) * 100)
                 else:
                     rate = 100 
@@ -572,6 +574,7 @@ def get_student_dashboard(student_id: int):
                 total_present += p
                 total_late += l
                 total_absent += a
+                total_leave += le  # 📌 บวกสะสมยอดรวมการลา
 
                 courses.append({
                     "id": c['id'],
@@ -582,6 +585,7 @@ def get_student_dashboard(student_id: int):
                     "present_count": p,
                     "late_count": l,
                     "absent_count": a,
+                    "leave_count": le,  # 📌 ส่งค่า leave_count กลับไปให้ Flutter
                     "attendance_rate": rate  
                 })
 
@@ -589,6 +593,7 @@ def get_student_dashboard(student_id: int):
                 student['present_count'] = total_present
                 student['late_count'] = total_late
                 student['absent_count'] = total_absent
+                student['leave_count'] = total_leave  
 
             return {
                 "status": "success",
@@ -1032,7 +1037,8 @@ async def upload_profile_image(user_id: int = Form(...), file: UploadFile = File
 
 class AttendanceRecordItem(BaseModel):
     student_id: int
-    status: str  # 'present', 'late', 'absent'
+    status: str
+    note: Optional[str] = None
 
 class ManualAttendanceRequest(BaseModel):
     subject_id: int
@@ -1047,50 +1053,43 @@ def save_manual_attendance(data: ManualAttendanceRequest):
             today_date = datetime.date.today().strftime('%Y-%m-%d')
             current_time = datetime.datetime.now().strftime('%H:%M:%S')
 
+            # ถ้ายังไม่มี session_id ส่งมา ให้สร้าง Session ใหม่ให้อัตโนมัติ
+            session_id = data.session_id
+            if not session_id:
+                cursor.execute(
+                    "INSERT INTO attendance_sessions (subject_id, session_date, start_time, status) VALUES (%s, %s, %s, 'active')",
+                    (data.subject_id, today_date, current_time)
+                )
+                connection.commit()
+                session_id = cursor.lastrowid
+
+            # วนลูปบันทึกสถานะและหมายเหตุของนักศึกษาแต่ละคน
             for record in data.records:
-                # 📌 สำคัญ: ต้องเช็คเฉพาะ session_id ของรอบปัจจุบันเท่านั้น เพื่อไม่ให้ไปทับรอบอื่น
-                if data.session_id:
-                    cursor.execute(
-                        """
-                        SELECT id FROM attendance_logs 
-                        WHERE student_id = %s AND subject_id = %s AND session_id = %s
-                        """,
-                        (record.student_id, data.subject_id, data.session_id)
-                    )
-                else:
-                    # Fallback กรณีไม่มี session_id (ไม่ควรเกิดขึ้นถ้าเปิดรอบถูกต้อง)
-                    cursor.execute(
-                        """
-                        SELECT id FROM attendance_logs 
-                        WHERE student_id = %s AND subject_id = %s AND session_date = %s AND session_id IS NULL
-                        """,
-                        (record.student_id, data.subject_id, today_date)
-                    )
-                
+                # ตรวจสอบว่ามีประวัติการเช็คชื่อในรอบนี้แล้วหรือยัง
+                cursor.execute(
+                    "SELECT id FROM attendance_logs WHERE student_id = %s AND subject_id = %s AND session_id = %s",
+                    (record.student_id, data.subject_id, session_id)
+                )
                 existing = cursor.fetchone()
 
                 if existing:
-                    # ถ้ามีในรอบนี้แล้ว ให้อัปเดต
+                    # ถ้ามีแล้วให้อัปเดตสถานะและหมายเหตุ
                     cursor.execute(
-                        """
-                        UPDATE attendance_logs 
-                        SET status = %s, check_in_time = %s 
-                        WHERE id = %s
-                        """,
-                        (record.status, current_time, existing['id'])
+                        "UPDATE attendance_logs SET status = %s, note = %s WHERE id = %s",
+                        (record.status, record.note, existing['id'])
                     )
                 else:
-                    # ถ้ายังไม่มีในรอบนี้ ให้เพิ่มใหม่ (INSERT) แยกตาม session_id
+                    # ถ้ายังไม่มีให้เพิ่มใหม่
                     cursor.execute(
                         """
-                        INSERT INTO attendance_logs (student_id, subject_id, session_id, session_date, check_in_time, status)
-                        VALUES (%s, %s, %s, %s, %s, %s)
+                        INSERT INTO attendance_logs (student_id, subject_id, session_id, session_date, check_in_time, status, note)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
                         """,
-                        (record.student_id, data.subject_id, data.session_id, today_date, current_time, record.status)
+                        (record.student_id, data.subject_id, session_id, today_date, current_time, record.status, record.note)
                     )
 
             connection.commit()
-            return {"status": "success", "message": "บันทึกผลการเช็คชื่อสำเร็จ"}
+            return {"status": "success", "message": "บันทึกผลการเช็คชื่อและหมายเหตุสำเร็จ"}
     except Exception as e:
         connection.rollback()
         raise HTTPException(status_code=500, detail=str(e))
@@ -1161,52 +1160,33 @@ def get_active_sessions(teacher_id: int):
         connection.close()
 
 @app.get("/api/teacher/subjects/{subject_id}/students")
-def get_teacher_subject_students(subject_id: int, session_id: Optional[int] = None):
+def get_subject_students(subject_id: int, session_id: Optional[int] = None):
     connection = get_db_connection()
     try:
         with connection.cursor() as cursor:
-            # 📌 ถ้ามีการส่ง session_id มา ให้ดึงสถานะจาก attendance_logs เฉพาะรอบนั้นๆ
             if session_id:
-                sql = """
-                    SELECT DISTINCT
-                        u.id AS user_id,
-                        u.student_id,
-                        u.full_name,
-                        u.faculty,
-                        u.email,
-                        (
-                            SELECT a.status 
-                            FROM attendance_logs a 
-                            WHERE a.student_id = u.id 
-                              AND a.subject_id = ss.subject_id 
-                              AND a.session_id = %s 
-                            LIMIT 1
-                        ) AS current_status
+                # 📌 ดึงรายชื่อนักศึกษา พร้อมเชื่อมโยงกับ attendance_logs เพื่อเอาสถานะและ note เดิมขึ้นมาแสดง
+                cursor.execute("""
+                    SELECT u.id as user_id, u.full_name, u.student_id, 
+                           al.status as current_status, al.note
                     FROM subject_students ss
                     JOIN users u ON ss.student_id = u.id
+                    LEFT JOIN attendance_logs al ON al.student_id = u.id 
+                        AND al.subject_id = ss.subject_id 
+                        AND al.session_id = %s
                     WHERE ss.subject_id = %s
-                """
-                cursor.execute(sql, (session_id, subject_id))
+                """, (session_id, subject_id))
             else:
-                # กรณีเรียกแบบไม่มี session_id ให้ current_status เป็น NULL ทั้งหมด (ว่างเปล่า)
-                sql = """
-                    SELECT DISTINCT
-                        u.id AS user_id,
-                        u.student_id,
-                        u.full_name,
-                        u.faculty,
-                        u.email,
-                        NULL AS current_status
+                cursor.execute("""
+                    SELECT u.id as user_id, u.full_name, u.student_id, 
+                           NULL as current_status, NULL as note
                     FROM subject_students ss
                     JOIN users u ON ss.student_id = u.id
                     WHERE ss.subject_id = %s
-                """
-                cursor.execute(sql, (subject_id,))
-                
+                """, (subject_id,))
+            
             students = cursor.fetchall()
             return {"status": "success", "students": students}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
     finally:
         connection.close()
 
